@@ -2,7 +2,7 @@ import os
 
 # prj path
 SCRIPT_PATH = os.path.dirname(os.path.abspath(__file__))
-BUILD_PATH = os.path.join(SCRIPT_PATH, "..", "build")
+BUILD_PATH = os.path.join(SCRIPT_PATH, "..", "lua", "pinyin_flash")
 
 # 输入拼音文件 unicode codepoint: 拼音
 # e.g. pinyin-data: U+4E01: dīng  # 丁
