@@ -15,7 +15,7 @@
 
 ```lua
 {
-  "YihanWn/Pinyin-Flash.nvim",
+  "YihanWn/Pinyin-Flash",
   event = "VeryLazy",
   config = function()
     require("pinyin_flash").setup()
