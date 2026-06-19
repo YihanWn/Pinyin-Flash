@@ -126,39 +126,41 @@ function M.collect_cn()
   return results
 end
 
--- ── 收集可见英文字符 ──────────────────────────────────────────
--- 在可见区域中找所有匹配 letter 的英文/数字/符号位置（类似 flash.nvim 的 s 键行为）
+-- ── 收集可见英文字符（支持多字符搜索） ──────────────────────────
+-- 在可见区域中找所有匹配 search_str 的英文/数字/符号位置
+-- 行为类似 flash.nvim 的原生 s 键：多字符增量搜索
 -- 跳过中文汉字，避免与 collect_cn 重复
 -- 返回: { char, lnum, byte_col, byte_len, pattern, kind="en" }[]
-function M.collect_en(letter)
+function M.collect_en(search_str)
+  if not search_str or #search_str == 0 then return {} end
+
   local winid = vim.api.nvim_get_current_win()
   local bufnr = vim.api.nvim_win_get_buf(winid)
   local top = vim.fn.line("w0")
   local bottom = vim.fn.line("w$")
-
-  -- 不区分大小写，匹配任意位置的 letter（不使用 \< 单词边界，与 flash.nvim 行为一致）
-  local pattern = "\\c" .. letter
+  local lower_search = search_str:lower()
+  local search_len = #search_str
 
   local results = {}
   for lnum = top, bottom do
     local lines = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)
     local line = lines[1]
-    if line and #line > 0 then
+    if line and #line >= search_len then
       local pos = 1
-      while pos <= #line do
+      while pos <= #line - search_len + 1 do
         local cp, len, next_pos = decode_utf8_at(line, pos)
         if not cp then
           pos = next_pos
         elseif not is_cjk(cp) then
-          -- 非汉字字符：检查是否匹配用户输入的字母
-          local ch = line:sub(pos, pos + len - 1)
-          if ch:lower() == letter then
+          -- 非汉字字符位置：检查从此开始的子串是否匹配
+          local chunk = line:sub(pos, pos + search_len - 1)
+          if chunk:lower() == lower_search then
             table.insert(results, {
-              char = ch,
+              char = chunk,
               lnum = lnum,
               byte_col = pos,
-              byte_len = len,
-              pattern = letter,   -- 用 pattern 代替 initial 区分中英文
+              byte_len = search_len,
+              pattern = search_str,
               kind = "en",
             })
           end
@@ -173,42 +175,50 @@ function M.collect_en(letter)
 end
 
 -- ── 输入辅助 ──────────────────────────────────────────────────
---- 从用户获取一个字母 a-z，取消则返回 nil
-local function get_input_letter(prompt)
-  ensure_highlights()
-  vim.api.nvim_echo({ { prompt or "输入首字母 (a-z): ", "PinyinFlashPrompt" } }, false, {})
-
+--- 读取一个原始按键，返回字符或 nil（取消）
+local function read_key_raw()
   local ok, key = pcall(vim.fn.getchar)
-  if not ok then
-    vim.api.nvim_echo({ { "" }, false, {} })
-    return nil
-  end
-
+  if not ok then return nil end
   local ch = vim.fn.nr2char(key)
   -- ESC (27), Ctrl-^ (30), Ctrl-C (3) 都视为取消
   if ch == "\27" or ch == "\30" or key == 3 then
-    vim.api.nvim_echo({ { "" }, false, {} })
     return nil
   end
-
-  local initial = ch:lower()
-  if not initial:match("^[a-z]$") then
-    vim.api.nvim_echo({ { "已取消", "WarningMsg" } }, true, {})
-    return nil
+  -- <BS> 返回特殊标记
+  if key == 127 or ch == "\8" then
+    return "<BS>"
   end
-  return initial
+  return ch:lower()
 end
 
---- 从用户获取一个标签字母，取消则返回 nil
-local function get_label_input()
-  local ok2, label_input = pcall(vim.fn.getchar)
-  if not ok2 then return nil end
-
-  local label_ch = vim.fn.nr2char(label_input):lower()
-  if label_ch == "\27" or label_ch == "\30" or label_input == 3 then
-    return nil
+--- 执行跳转到 match 位置
+local function do_jump(m, is_visual, visual_start)
+  if is_visual and visual_start then
+    vim.api.nvim_win_set_cursor(0, { m.lnum, m.byte_col - 1 })
+    vim.cmd("normal! v")
+    vim.api.nvim_win_set_cursor(0, visual_start)
+  else
+    vim.cmd("normal! m'")
+    pcall(vim.api.nvim_win_set_cursor, 0, { m.lnum, m.byte_col - 1 })
   end
-  return label_ch
+  vim.cmd("normal! zz")
+end
+
+--- 为匹配列表分配标签并显示 extmarks
+local function show_match_labels(matches)
+  local label_set = "abcdefghijklmnopqrstuvwxyz"
+  for i, m in ipairs(matches) do
+    if i > #label_set then break end
+    m.label = label_set:sub(i, i)
+    local hl = (m.kind == "cn") and "PinyinFlashLabel" or "PinyinFlashLabelEn"
+    pcall(vim.api.nvim_buf_set_extmark, 0, ns_id, m.lnum - 1, m.byte_col - 1, {
+      virt_text = { { " " .. m.label .. " ", hl } },
+      virt_text_pos = "overlay",
+      hl_mode = "combine",
+      priority = 250,
+      strict = false,
+    })
+  end
 end
 
 -- ── 清理 extmarks ─────────────────────────────────────────────
@@ -231,8 +241,14 @@ function M.pinyin_jump(opts)
   end
 
   -- 获取首字母输入
-  local initial = get_input_letter("(拼音) 输入首字母 (a-z): ")
-  if not initial then return end
+  vim.api.nvim_echo({ { "(拼音) 输入首字母 (a-z): ", "PinyinFlashPrompt" } }, false, {})
+  local key = read_key_raw()
+  if not key then return end
+  local initial = key:match("^[a-z]$") and key or nil
+  if not initial then
+    vim.api.nvim_echo({ { "已取消", "WarningMsg" } }, true, {})
+    return
+  end
 
   -- 按首字母筛选
   local matches = {}
@@ -257,23 +273,11 @@ function M.pinyin_jump(opts)
   end
 
   -- 多匹配 → 分配标签并显示
-  local label_set = "abcdefghijklmnopqrstuvwxyz"
-
-  for i, m in ipairs(matches) do
-    if i > #label_set then break end
-    m.label = label_set:sub(i, i)
-    pcall(vim.api.nvim_buf_set_extmark, 0, ns_id, m.lnum - 1, m.byte_col - 1, {
-      virt_text = { { " " .. m.label .. " ", "PinyinFlashLabel" } },
-      virt_text_pos = "overlay",
-      hl_mode = "combine",
-      priority = 250,
-      strict = false,
-    })
-  end
+  show_match_labels(matches)
 
   -- 等待标签选择
   vim.api.nvim_echo({ { "(拼音) 跳转到: ", "PinyinFlashPrompt" } }, false, {})
-  local label_ch = get_label_input()
+  local label_ch = read_key_raw()
   M.clear_labels()
 
   if not label_ch then
@@ -296,123 +300,142 @@ function M.pinyin_jump(opts)
   vim.api.nvim_echo({ { "(拼音) 已取消", "WarningMsg" } }, true, {})
 end
 
--- ── 综合跳转：中文拼音 + 英文单词 ─────────────────────────────
--- 按一个字母，同时高亮中文（拼音以此字母开头）和英文（以此字母开头的单词）
--- 标签风格：中文用红色底色，英文用橙色底色
+-- ── 综合跳转：中文拼音 + 英文 flash 原生风格 ──────────────────
+-- 输入模式类似 flash.nvim：支持多字符增量搜索英文，同时匹配中文拼音首字母
+--   s + t     → 高亮所有 't'（英文） + 拼音首字母为 't' 的汉字
+--   s + t + e → 高亮所有 "te"（英文） + 拼音首字母为 't' 的汉字（不变）
+-- 标签用不同颜色区分：中文红色，英文橙色
 function M.combined_jump(opts)
   opts = opts or {}
   ensure_highlights()
 
   local is_visual = vim.fn.mode():find("v")
   local saved_view = vim.fn.winsaveview()
-  local visual_start  ---@type {lnum:number, col:number}?
-
+  local visual_start ---@type {lnum:number, col:number}?
   if is_visual then
-    -- 保存 visual 模式的起始位置
     visual_start = vim.api.nvim_buf_get_mark(0, "<")
   end
 
-  -- 第一步：获取字母输入
-  local initial = get_input_letter("(中+英 flash) 输入字母 (a-z): ")
-  if not initial then return end
+  local search_str = ""
+  local cn_matches = {} -- 中文匹配（由首字母决定，之后保持不变）
+  local matches = {}     -- 当前全部匹配
 
-  -- 第二步：同时收集中文和英文匹配
-  local chars = M.collect_cn()
-  local en_matches = M.collect_en(initial)
+  -- 首屏提示
+  vim.api.nvim_echo({ { "(flash+拼音) 输入字母: ", "PinyinFlashPrompt" } }, false, {})
 
-  local matches = {}
-
-  -- 中文匹配
-  for _, c in ipairs(chars) do
-    if c.initial == initial then
-      table.insert(matches, c)
-    end
-  end
-
-  -- 英文匹配
-  for _, m in ipairs(en_matches) do
-    table.insert(matches, m)
-  end
-
-  if #matches == 0 then
-    vim.api.nvim_echo({ { "(flash+拼音) 没有以「" .. initial .. "」开头的字或词", "WarningMsg" } }, true, {})
-    return
-  end
-
-  -- 按行、列排序
-  table.sort(matches, function(a, b)
-    if a.lnum ~= b.lnum then return a.lnum < b.lnum end
-    return a.byte_col < b.byte_col
-  end)
-
-  -- 唯一匹配 → 直接跳转
-  if #matches == 1 then
-    local m = matches[1]
-    if is_visual and visual_start then
-      vim.api.nvim_win_set_cursor(0, { m.lnum, m.byte_col - 1 })
-      vim.cmd("normal! v")
-      vim.api.nvim_win_set_cursor(0, visual_start)
-    else
-      vim.cmd("normal! m'")
-      pcall(vim.api.nvim_win_set_cursor, 0, { m.lnum, m.byte_col - 1 })
-    end
-    vim.cmd("normal! zz")
-    return
-  end
-
-  -- 多匹配 → 分配标签并显示
-  local label_set = "abcdefghijklmnopqrstuvwxyz"
-
-  for i, m in ipairs(matches) do
-    if i > #label_set then break end
-    m.label = label_set:sub(i, i)
-
-    local hl = (m.kind == "cn") and "PinyinFlashLabel" or "PinyinFlashLabelEn"
-    pcall(vim.api.nvim_buf_set_extmark, 0, ns_id, m.lnum - 1, m.byte_col - 1, {
-      virt_text = { { " " .. m.label .. " ", hl } },
-      virt_text_pos = "overlay",
-      hl_mode = "combine",
-      priority = 250,
-      strict = false,
-    })
-  end
-
-  -- 等待标签选择
-  vim.api.nvim_echo({ { "(flash+拼音) 跳转到: ", "PinyinFlashPrompt" } }, false, {})
-  local label_ch = get_label_input()
-  M.clear_labels()
-
-  if not label_ch then
-    if is_visual then
-      vim.cmd("normal! \27") -- 退出 visual
-    end
-    vim.fn.winrestview(saved_view)
-    return
-  end
-
-  -- 执行跳转
-  for _, m in ipairs(matches) do
-    if m.label == label_ch then
-      if is_visual and visual_start then
-        -- Visual mode: 从 visual start 扩展到目标
-        vim.api.nvim_win_set_cursor(0, { m.lnum, m.byte_col - 1 })
-        vim.cmd("normal! v")
-        vim.api.nvim_win_set_cursor(0, visual_start)
-      else
-        vim.cmd("normal! m'")
-        pcall(vim.api.nvim_win_set_cursor, 0, { m.lnum, m.byte_col - 1 })
-      end
-      vim.cmd("normal! zz")
+  while true do
+    -- ── 读取按键 ────────────────────────────────────────────
+    local key = read_key_raw()
+    if not key then
+      -- ESC / Ctrl-C → 取消
+      M.clear_labels()
+      if is_visual then vim.cmd("normal! \27") end
+      vim.fn.winrestview(saved_view)
       return
     end
-  end
 
-  -- 按了无效的标签键
-  if is_visual then
-    vim.cmd("normal! \27")
+    -- ── Backspace ────────────────────────────────────────────
+    if key == "<BS>" then
+      if #search_str > 0 then
+        search_str = search_str:sub(1, -2)
+        if #search_str == 0 then
+          cn_matches = {}
+          vim.api.nvim_echo({ { "(flash+拼音) 输入字母: ", "PinyinFlashPrompt" } }, false, {})
+          M.clear_labels()
+          goto continue
+        end
+      else
+        vim.api.nvim_echo({ { "(flash+拼音) 输入字母: ", "PinyinFlashPrompt" } }, false, {})
+        M.clear_labels()
+        goto continue
+      end
+    end
+
+    -- ── 字母键 ───────────────────────────────────────────────
+    if key:match("^[a-z]$") then
+      -- 先检查是否是已显示标签 → 直接跳转
+      for _, m in ipairs(matches) do
+        if m.label == key then
+          M.clear_labels()
+          do_jump(m, is_visual, visual_start)
+          return
+        end
+      end
+
+      -- 不是标签 → 追加到搜索串
+      search_str = search_str .. key
+    else
+      -- 非字母、非 BS → 取消
+      M.clear_labels()
+      if is_visual then vim.cmd("normal! \27") end
+      vim.fn.winrestview(saved_view)
+      return
+    end
+
+    -- ── 更新匹配列表 ────────────────────────────────────────
+    M.clear_labels()
+    matches = {}
+
+    -- 英文匹配：搜索 search_str 在非中文区域的所有出现
+    local en_list = M.collect_en(search_str)
+    for _, m in ipairs(en_list) do
+      table.insert(matches, m)
+    end
+
+    -- 中文匹配：由首字母决定，仅在首次收集
+    if #search_str == 1 then
+      cn_matches = {}
+      local chars = M.collect_cn()
+      local first_letter = search_str:sub(1, 1)
+      for _, c in ipairs(chars) do
+        if c.initial == first_letter then
+          table.insert(cn_matches, c)
+        end
+      end
+    end
+    for _, m in ipairs(cn_matches) do
+      table.insert(matches, m)
+    end
+
+    -- 按行、列排序
+    table.sort(matches, function(a, b)
+      if a.lnum ~= b.lnum then return a.lnum < b.lnum end
+      return a.byte_col < b.byte_col
+    end)
+
+    -- ── 处理匹配数量 ────────────────────────────────────────
+    if #matches == 0 then
+      vim.api.nvim_echo({
+        { "(flash+拼音) 「" .. search_str .. "」无匹配", "WarningMsg" },
+      }, true, {})
+      -- 回退最后一个字符
+      search_str = search_str:sub(1, -2)
+      if #search_str == 0 then cn_matches = {} end
+      vim.api.nvim_echo({
+        { "(flash+拼音) " .. (#search_str > 0 and "「" .. search_str .. "」" or "输入字母: "), "PinyinFlashPrompt" },
+      }, false, {})
+      goto continue
+    end
+
+    if #matches == 1 then
+      -- 唯一匹配 → 直接跳转
+      M.clear_labels()
+      do_jump(matches[1], is_visual, visual_start)
+      return
+    end
+
+    -- ── 显示标签 ────────────────────────────────────────────
+    show_match_labels(matches)
+
+    local suffix = #search_str > 1 and "  | <BS> 回退" or ""
+    vim.api.nvim_echo({
+      { "(flash+拼音) 「" .. search_str .. "」→ ", "PinyinFlashPrompt" },
+      { "(" .. #matches .. ")", "Comment" },
+      { suffix, "Comment" },
+    }, false, {})
+
+    ::continue::
   end
-  vim.fn.winrestview(saved_view)
-  vim.api.nvim_echo({ { "(flash+拼音) 已取消", "WarningMsg" } }, true, {})
 end
 
 -- ── 初始化入口 ────────────────────────────────────────────────

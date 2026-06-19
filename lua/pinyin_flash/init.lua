@@ -15,7 +15,7 @@ function M.jump(opts)
   core.pinyin_jump(opts)
 end
 
--- 综合中英文跳转（拼音首字母 + 英文单词首字母）
+-- 综合中英文跳转（拼音首字母 + flash 原生风格英文多字符搜索）
 function M.combined_jump(opts)
   core.combined_jump(opts)
 end
