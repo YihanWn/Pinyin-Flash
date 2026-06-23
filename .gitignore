@@ -6,4 +6,6 @@ __pycache__/
 .DS_Store
 
 # Screenshots
-pic/
+pic/*
+!pic/test1.png
+!pic/test_search.png
