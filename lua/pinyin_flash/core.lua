@@ -205,7 +205,7 @@ function M.collect_cn_flash_matches(winid, query)
       table.insert(matches, {
         win = winid,
         pos = { c.lnum, c.byte_col - 1 },
-        end_pos = { c.lnum, c.byte_col - 1 },
+        end_pos = { c.lnum, c.byte_col + c.byte_len - 2 },
       })
     end
   end
@@ -297,9 +297,9 @@ local function show_match_labels(matches)
     if i > #label_set then break end
     m.label = label_set:sub(i, i)
     local hl = (m.kind == "cn") and "PinyinFlashLabel" or "PinyinFlashLabelEn"
-    pcall(vim.api.nvim_buf_set_extmark, 0, ns_id, m.lnum - 1, m.byte_col - 1, {
-      virt_text = { { " " .. m.label .. " ", hl } },
-      virt_text_pos = "overlay",
+    pcall(vim.api.nvim_buf_set_extmark, 0, ns_id, m.lnum - 1, m.byte_col + m.byte_len - 1, {
+      virt_text = { { m.label, hl } },
+      virt_text_pos = "inline",
       hl_mode = "combine",
       priority = 250,
       strict = false,
@@ -396,6 +396,11 @@ function M.combined_jump(opts)
   local flash_opts = opts.flash or opts.flash_opts or {}
   flash_opts = type(flash_opts) == "table" and vim.deepcopy(flash_opts) or {}
   flash_opts = vim.tbl_deep_extend("force", {
+    label = {
+      style = "inline",
+      after = true,
+      before = false,
+    },
     highlight = {
       groups = {
         label = "PinyinFlashLabel",
